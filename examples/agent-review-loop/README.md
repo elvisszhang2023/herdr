@@ -9,9 +9,9 @@ Orchestrator worktree → dynamic Workspace/Pane → Codex coding → local comm
      └──── findings and automatic fix ┘
 ```
 
-The loop runs for at most three review rounds. It does not push, create a PR,
-or merge. After review approval, the managed worktree and branch remain for a
-human to inspect and create a Draft PR.
+The loop runs for at most three review rounds. After Review approval, the
+Orchestrator pushes the branch and creates or reuses a Draft PR. It never
+merges. The managed worktree and branch remain for inspection.
 
 When configured, the orchestrator can also notify a human when any pane listed
 in `notification_pane_ids` enters `blocked`, or when the orchestrator enters `awaiting_human`. The
@@ -60,8 +60,9 @@ The orchestrator reads the open Issue through the local `gh` CLI and sends its
 title and body to the coding Agent as requirements. The Issue text is treated
 as untrusted project input; it cannot authorize secret access, permission
 changes, bypassing review, or merging. With `write_back = true`, lifecycle
-comments are appended to the Issue. The current Phase 1 implementation still
-does not create or update a PR, push, or merge.
+comments are appended to the Issue. With `push_on_approval` and
+`draft_pr_on_approval` enabled, the approved head is pushed and a Draft PR is
+created or reused. Merge remains a manual action.
 
 In worktree mode, the Orchestrator checks that the source repository is clean,
 creates a task branch such as `codex/issue-123` from `base_branch`, and places

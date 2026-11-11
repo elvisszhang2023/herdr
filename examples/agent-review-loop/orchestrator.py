@@ -35,6 +35,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback message
 TERMINAL_STATES = {"idle", "done"}
 STOP_STATES = {"blocked", "unknown"}
 MAX_READ_LINES = 240
+PROMPT_RETRY_ATTEMPTS = 3
+REVIEW_READ_RETRY_SECONDS = 30
 
 
 class LoopError(RuntimeError):
@@ -159,6 +161,8 @@ class BlockNotifier:
             lines.append(f"head：{payload['head_sha']}")
         if payload.get("repo_root"):
             lines.append(f"目录：{payload['repo_root']}")
+        if payload.get("pr_url"):
+            lines.append(f"Draft PR：{payload['pr_url']}")
         return "\n".join(lines)
 
     def notify(self, payload: dict[str, Any]) -> None:
@@ -176,7 +180,7 @@ class BlockNotifier:
                 "markdown": {"content": text.replace("\n", "\n\n")},
             }
         else:
-            body = {"event": "agent.blocked", "text": text, "data": payload}
+            body = {"event": payload.get("event", "agent.blocked"), "text": text, "data": payload}
         encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
         request = urllib_request.Request(
             self.url,
@@ -202,6 +206,8 @@ class GitHubIssue:
         self.number = settings.get("issue_number")
         self.write_back = bool(settings.get("write_back", False))
         self.comment_updates = bool(settings.get("comment_updates", True))
+        self.push_on_approval = bool(settings.get("push_on_approval", True))
+        self.draft_pr_on_approval = bool(settings.get("draft_pr_on_approval", True))
         if not self.enabled:
             return
         if not self.repo or not isinstance(self.number, int) or self.number <= 0:
@@ -284,6 +290,121 @@ feature branch. Do not merge or push. Report the commit SHA, tests, and risks.
         suffix = f"\n\n{detail}" if detail else ""
         self.comment(f"Agent workflow `{task_id}` status: `{phase}`.{suffix}")
 
+    def existing_draft_pr(self, branch: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        output = self._gh(
+            "pr", "list", "--repo", self.repo, "--head", branch,
+            "--state", "open", "--json", "number,url,isDraft,headRefName,baseRefName",
+        )
+        try:
+            pull_requests = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise LoopError(f"GitHub PR list response was not valid JSON: {exc}") from exc
+        for pull_request in pull_requests:
+            if pull_request.get("headRefName") == branch:
+                return pull_request
+        return None
+
+    def publish_draft_pr(
+        self,
+        branch: str,
+        base_branch: str,
+        head_sha: str,
+        task_id: str,
+        issue: dict[str, Any],
+        repo_path: Path,
+    ) -> dict[str, Any]:
+        """Push the reviewed branch and create or reuse one open Draft PR."""
+        if not self.enabled:
+            raise LoopError("GitHub publishing requires github.enabled = true")
+        if self.push_on_approval:
+            run_command(
+                ["git", "push", "--set-upstream", "origin", branch],
+                cwd=repo_path,
+                timeout=120,
+            )
+        if not self.draft_pr_on_approval:
+            return {"headRefName": branch, "baseRefName": base_branch, "isDraft": False}
+        existing = self.existing_draft_pr(branch)
+        if existing:
+            log(f"reusing existing open PR #{existing.get('number')} for {branch}")
+            return existing
+        title = str(issue.get("title") or f"Implement {task_id}").strip()
+        body = (
+            f"## Agent workflow\n\n"
+            f"- Issue: {issue.get('url', '')}\n"
+            f"- Task: `{task_id}`\n"
+            f"- Reviewed commit: `{head_sha}`\n"
+            f"- Base branch: `{base_branch}`\n\n"
+            "This Draft PR was created automatically after local tests and Agent Review passed. "
+            "No merge was performed."
+        )
+        output = self._gh(
+            "pr", "create", "--repo", self.repo, "--head", branch,
+            "--base", base_branch, "--draft", "--title", title, "--body", body,
+        )
+        url = output.strip().splitlines()[-1] if output.strip() else ""
+        if not url.startswith("http"):
+            raise LoopError(f"GitHub PR create did not return a URL: {output[-2000:]}")
+        return {"url": url, "headRefName": branch, "baseRefName": base_branch, "isDraft": True}
+
+    def comment_review_result(
+        self,
+        pr_url: str,
+        review: dict[str, Any],
+        head_sha: str,
+    ) -> None:
+        """Write the local Agent Review result back to the PR once."""
+        if not self.enabled or not pr_url:
+            return
+        marker = f"<!-- herdr-agent-review:{head_sha} -->"
+        existing_output = self._gh(
+            "pr", "view", pr_url, "--json", "comments", check=False
+        )
+        try:
+            existing = json.loads(existing_output) if existing_output else {}
+        except json.JSONDecodeError:
+            existing = {}
+        comments = existing.get("comments", []) if isinstance(existing, dict) else []
+        if any(marker in str(comment.get("body", "")) for comment in comments):
+            log(f"Review result already exists on {pr_url}")
+            return
+
+        lines = [
+            marker,
+            "## Herdr Agent Review",
+            "",
+            f"- Result: `{review.get('result', 'unknown')}`",
+            f"- Reviewed commit: `{head_sha}`",
+            "",
+            str(review.get("summary") or "No summary provided."),
+        ]
+        findings = review.get("findings") or []
+        if findings:
+            lines.extend(["", "### Findings", ""])
+            for finding in findings:
+                severity = finding.get("severity", "unknown")
+                location = str(finding.get("file") or "unknown file")
+                if finding.get("line") is not None:
+                    location += f":{finding['line']}"
+                lines.extend(
+                    [
+                        f"- **{severity}** — `{location}`: {finding.get('message', '')}",
+                        f"  - Suggestion: {finding.get('suggestion', '')}",
+                    ]
+                )
+        body = "\n".join(lines)
+        result = run_command(
+            ["gh", "pr", "comment", pr_url, "--repo", self.repo, "--body", body],
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            log(f"GitHub PR Review comment failed: {result.stdout[-2000:]}")
+        else:
+            log(f"Review result written to {pr_url}")
+
 
 @dataclass
 class LoopState:
@@ -304,6 +425,9 @@ class LoopState:
     issue_repo: str | None = None
     issue_number: int | None = None
     issue_url: str | None = None
+    pushed: bool = False
+    pr_url: str | None = None
+    pr_number: int | None = None
     last_result: dict[str, Any] | None = None
     last_error: str | None = None
     notification_keys: list[str] = field(default_factory=list)
@@ -451,6 +575,28 @@ def agent_prompt(pane_id: str, prompt: str, timeout_seconds: int) -> None:
         log(f"prompt accepted by {pane_id}: {result.stdout.strip()[-500:]}")
 
 
+def agent_prompt_with_retry(
+    pane_id: str,
+    prompt: str,
+    timeout_seconds: int,
+    label: str,
+) -> None:
+    """Keep a transient prompt failure from silently breaking the loop."""
+    last_error: LoopError | None = None
+    for attempt in range(1, PROMPT_RETRY_ATTEMPTS + 1):
+        try:
+            agent_prompt(pane_id, prompt, timeout_seconds)
+            log(f"{label} delivered to {pane_id}")
+            return
+        except LoopError as exc:
+            last_error = exc
+            log(f"{label} delivery attempt {attempt}/{PROMPT_RETRY_ATTEMPTS} failed: {exc}")
+            if attempt < PROMPT_RETRY_ATTEMPTS:
+                time.sleep(2)
+    assert last_error is not None
+    raise last_error
+
+
 def agent_read(pane_id: str) -> str:
     return run_command(
         [
@@ -494,6 +640,7 @@ class ReviewLoop:
         self.source_repo = Path(config["repo_root"]).expanduser().resolve()
         self.repo = self.source_repo
         self.state_path = safe_state_path(config_path, config)
+        self.review_result_path = self.repo / ".herdr" / "review-result.json"
         self.subscriber: EventSubscriber | None = None
         self.state: LoopState | None = None
         self.notifier = BlockNotifier(config)
@@ -574,17 +721,48 @@ class ReviewLoop:
         )
         if not reviewer_pane_id:
             raise LoopError("herdr pane split did not return the new pane_id")
-        run_command(
-            [herdr_binary(), "agent", "start", "codex", "--kind", str(self.config.get("coder_agent_kind", "codex")), "--pane", root_pane_id],
-            timeout=120,
-        )
-        run_command(
-            [herdr_binary(), "agent", "start", "claude", "--kind", str(self.config.get("reviewer_agent_kind", "claude")), "--pane", reviewer_pane_id],
-            timeout=120,
-        )
         self.repo = actual_path
+        self.review_result_path = self.repo / ".herdr" / "review-result.json"
+        self.review_result_path.parent.mkdir(parents=True, exist_ok=True)
+        exclude_path = Path(git(self.repo, "rev-parse", "--git-path", "info/exclude"))
+        if not exclude_path.is_absolute():
+            exclude_path = (self.repo / exclude_path).resolve()
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_excludes = exclude_path.read_text() if exclude_path.exists() else ""
+        if "/.herdr/" not in existing_excludes and ".herdr/" not in existing_excludes:
+            with exclude_path.open("a") as handle:
+                if existing_excludes and not existing_excludes.endswith("\n"):
+                    handle.write("\n")
+                handle.write("# Herdr agent-review-loop runtime files\n/.herdr/\n")
         self.notification_pane_ids.update({root_pane_id, reviewer_pane_id})
         return branch, base_sha, workspace_id, root_pane_id, reviewer_pane_id
+
+    def start_managed_agents(self) -> None:
+        assert self.state is not None
+        try:
+            run_command(
+                [
+                    herdr_binary(), "agent", "start", "codex",
+                    "--kind", str(self.config.get("coder_agent_kind", "codex")),
+                    "--pane", self.state.coder_pane_id,
+                ],
+                timeout=120,
+            )
+        except LoopError as exc:
+            # Herdr has already detected the CLI in a startup dialog. Keep
+            # the orchestrator alive so the event loop can notify the human
+            # and resume after the dialog is handled.
+            if "agent_not_ready" not in str(exc):
+                raise
+            log(f"coder is blocked during startup; waiting for {self.state.coder_pane_id} to become ready")
+        run_command(
+            [
+                herdr_binary(), "agent", "start", "claude",
+                "--kind", str(self.config.get("reviewer_agent_kind", "claude")),
+                "--pane", self.state.reviewer_pane_id,
+            ],
+            timeout=120,
+        )
 
     def base_sha(self) -> str:
         return git(self.repo, "rev-parse", self.config["base_branch"])
@@ -618,9 +796,34 @@ class ReviewLoop:
             issue_url=self.issue.get("url") if self.github_issue.enabled else None,
         )
         self.state.save(self.state_path)
+        log(f"state file: {self.state_path}")
         log(f"task {task_id} started on branch {branch}; base {base_sha[:12]}")
         if self.github_issue.enabled:
             self.github_issue.started_comment(self.issue, task_id, branch)
+
+    def resume_existing(self) -> None:
+        """Resume a failed loop without recreating its worktree or Agents."""
+        try:
+            payload = json.loads(self.state_path.read_text())
+            self.state = LoopState(**payload)
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            raise LoopError(f"cannot resume from state file {self.state_path}: {exc}") from exc
+        if not self.state.worktree_path:
+            raise LoopError("cannot resume a task without a worktree path")
+        self.source_repo = Path(self.state.source_repo_root).expanduser().resolve()
+        self.repo = Path(self.state.worktree_path).expanduser().resolve()
+        if not self.repo.is_dir():
+            raise LoopError(f"saved task worktree does not exist: {self.repo}")
+        self.review_result_path = self.repo / ".herdr" / "review-result.json"
+        self.notification_pane_ids.update(
+            {self.state.coder_pane_id, self.state.reviewer_pane_id}
+        )
+        if self.github_issue.enabled:
+            self.issue = self.github_issue.load()
+        log(
+            f"resuming task {self.state.task_id} from phase {self.state.phase}; "
+            f"branch {self.state.branch}, head {self.state.head_sha}"
+        )
 
     def set_phase(self, phase: str, error: str | None = None) -> None:
         assert self.state is not None
@@ -775,6 +978,12 @@ class ReviewLoop:
         head_sha = git(self.repo, "rev-parse", "HEAD")
         self.state.head_sha = head_sha
         self.state.save(self.state_path)
+        try:
+            self.review_result_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise LoopError(
+                f"cannot remove previous Review result {self.review_result_path}: {exc}"
+            ) from exc
         stat = git(self.repo, "diff", "--stat", f"{self.state.base_sha}..{head_sha}")
         return f"""You are the read-only Review Agent for task {self.state.task_id}.
 
@@ -789,8 +998,15 @@ Diff stat:
 {stat[-3000:]}
 
 Do not modify files, commit, push, reset, or merge anything.
-Return exactly one JSON object, without Markdown fences:
+Write the final result as a JSON object to this exact file:
+{self.review_result_path}
+
+Write it atomically if possible (write a temporary file in the same directory,
+then rename it). Do not commit this file. The JSON must have this shape:
 {{"result":"approved"|"changes_requested","reviewed_head_sha":"{head_sha}","findings":[{{"severity":"blocking"|"important"|"minor","file":"path","line":1,"message":"problem and impact","suggestion":"fix direction"}}],"summary":"short conclusion"}}
+
+After writing the file, you may briefly report completion in the terminal, but
+the file is the authoritative Review result.
 """
 
     def fix_prompt(self, review: dict[str, Any]) -> str:
@@ -808,74 +1024,138 @@ and commit the fixes. Do not merge or push. When finished, report the new commit
 SHA and test result.
 """
 
-    def run(self) -> None:
-        self.initialize()
+    def read_review_with_retry(self) -> dict[str, Any]:
+        """Read the file result first, with terminal output as compatibility fallback."""
         assert self.state is not None
-        ensure_agent_target(self.state.coder_pane_id)
-        ensure_agent_target(self.state.reviewer_pane_id)
-        socket_path = os.environ.get("HERDR_SOCKET_PATH")
-        if not socket_path:
-            socket_path = str(Path.home() / ".config" / "herdr" / "herdr.sock")
-        self.subscriber = EventSubscriber(
-            socket_path,
-            sorted(self.notification_pane_ids),
-        )
-        self.subscriber.start()
-        try:
-            agent_prompt(
-                self.state.coder_pane_id,
-                self.github_issue.task_prompt(self.issue)
-                if self.github_issue.enabled
-                else self.config["task"],
-                int(self.config["prompt_timeout_seconds"]),
-            )
-            while True:
-                coder_status = self.wait_for_pane(self.state.coder_pane_id)
-                if coder_status in STOP_STATES:
-                    raise LoopError(f"coder entered {coder_status}")
-                if self.state.coder_pane_id in self.resumed_panes:
-                    self.resumed_panes.remove(self.state.coder_pane_id)
-                    agent_prompt(
-                        self.state.coder_pane_id,
-                        "Human intervention is complete. Continue the original task, run the required tests, and commit the result. Do not merge or push.",
-                        int(self.config["prompt_timeout_seconds"]),
-                    )
-                    continue
+        deadline = time.monotonic() + REVIEW_READ_RETRY_SECONDS
+        last_text = ""
+        last_file_error = ""
+        while True:
+            if self.review_result_path.exists():
                 try:
-                    self.require_new_commit()
-                    test_output = self.run_tests()
-                except LoopError as exc:
-                    self.set_phase("fixing", str(exc))
-                    agent_prompt(self.state.coder_pane_id, f"Tests failed:\n\n{exc}\n\nFix the failure and commit the changes.", int(self.config["prompt_timeout_seconds"]))
-                    continue
+                    review = json.loads(self.review_result_path.read_text())
+                    if isinstance(review, dict):
+                        if review.get("reviewed_head_sha") == self.state.head_sha:
+                            log(
+                                "review file parsed: "
+                                f"result={review.get('result')} "
+                                f"reviewed_head_sha={review.get('reviewed_head_sha')}"
+                            )
+                            return review
+                        last_file_error = (
+                            "Review file has a stale reviewed_head_sha "
+                            f"{review.get('reviewed_head_sha')!r}"
+                        )
+                    else:
+                        last_file_error = "Review file does not contain a JSON object"
+                except (OSError, json.JSONDecodeError) as exc:
+                    last_file_error = f"Review file is not complete JSON: {exc}"
 
-                self.state.review_round += 1
-                if self.state.review_round > self.state.max_review_rounds:
-                    self.set_phase("awaiting_human", "maximum review rounds reached")
-                    return
-                self.set_phase("reviewing")
-                agent_prompt(
-                    self.state.reviewer_pane_id,
-                    self.review_prompt(test_output),
-                    int(self.config["prompt_timeout_seconds"]),
+            try:
+                last_text = agent_read(self.state.reviewer_pane_id)
+            except LoopError as exc:
+                if "agent_not_idle" not in str(exc):
+                    raise
+                last_file_error = str(exc)
+                log("reviewer is still settling; retrying Review result read")
+                if time.monotonic() < deadline:
+                    time.sleep(2)
+                    continue
+                raise LoopError(
+                    "could not read a current Review result after retries; "
+                    f"{last_file_error}"
+                ) from exc
+            review = latest_json_object(last_text)
+            if review is not None and review.get("reviewed_head_sha") == self.state.head_sha:
+                log(
+                    "review terminal fallback parsed: "
+                    f"result={review.get('result')} "
+                    f"reviewed_head_sha={review.get('reviewed_head_sha')}"
                 )
-                reviewer_status = self.wait_for_pane(self.state.reviewer_pane_id)
-                if reviewer_status in STOP_STATES:
-                    raise LoopError(f"reviewer entered {reviewer_status}")
-                if self.state.reviewer_pane_id in self.resumed_panes:
-                    self.resumed_panes.remove(self.state.reviewer_pane_id)
-                    agent_prompt(
-                        self.state.reviewer_pane_id,
-                        self.review_prompt(test_output),
-                        int(self.config["prompt_timeout_seconds"]),
-                    )
-                    reviewer_status = self.wait_for_pane(self.state.reviewer_pane_id)
-                    if reviewer_status in STOP_STATES:
-                        raise LoopError(f"reviewer entered {reviewer_status}")
-                review_text = agent_read(self.state.reviewer_pane_id)
-                review = latest_json_object(review_text)
-                if review is None:
-                    raise LoopError("could not parse a Review JSON object from reviewer output")
+                return review
+            if time.monotonic() >= deadline:
+                excerpt = re.sub(r"\s+", " ", last_text[-1000:]).strip()
+                raise LoopError(
+                    "could not read a current Review result after retries; "
+                    f"{last_file_error}; terminal output: "
+                    f"last output: {excerpt}"
+                )
+            log("Review result file is not ready; retrying read")
+            time.sleep(2)
+
+    def publish_approved_result(self) -> None:
+        assert self.state is not None
+        if not self.github_issue.enabled:
+            raise LoopError("cannot create a Draft PR without GitHub Issue configuration")
+        if not (self.github_issue.push_on_approval or self.github_issue.draft_pr_on_approval):
+            self.set_phase("approved", "push and Draft PR creation are disabled")
+            return
+        self.set_phase("publishing")
+        pull_request = self.github_issue.publish_draft_pr(
+            branch=self.state.branch,
+            base_branch=self.state.base_branch,
+            head_sha=self.state.head_sha or git(self.repo, "rev-parse", "HEAD"),
+            task_id=self.state.task_id,
+            issue=self.issue,
+            repo_path=self.repo,
+        )
+        self.state.pushed = True
+        self.state.pr_url = str(pull_request.get("url") or "") or None
+        number = pull_request.get("number")
+        self.state.pr_number = int(number) if isinstance(number, int) else None
+        self.state.save(self.state_path)
+        if self.state.pr_url and self.state.last_result:
+            self.github_issue.comment_review_result(
+                self.state.pr_url,
+                self.state.last_result,
+                self.state.head_sha or git(self.repo, "rev-parse", "HEAD"),
+            )
+        if self.state.pr_url:
+            detail = f"Draft PR created or reused: {self.state.pr_url}"
+        elif self.state.pushed:
+            detail = "Branch pushed; Draft PR creation is disabled"
+        else:
+            detail = "Approved locally"
+        self.set_phase("approved", detail)
+        self.github_issue.comment(
+            f"Agent workflow `{self.state.task_id}` created or reused a Draft PR.\n\n"
+            f"- Branch: `{self.state.branch}`\n"
+            f"- Commit: `{self.state.head_sha}`\n"
+            f"- PR: {self.state.pr_url or '(URL unavailable)'}\n"
+            "- Status: `agent-approved` (not merged)"
+        )
+        self.notify_once(
+            f"{self.state.task_id}:approved:{self.state.head_sha}:{self.state.pr_url or 'draft-pr'}",
+            {
+                "event": "agent.review_approved",
+                "agent_name": "Herdr Orchestrator",
+                "status": "approved",
+                "reason": "Review 通过，分支已 push 并创建 Draft PR，等待人工 Review/Merge",
+                "pr_url": self.state.pr_url,
+            },
+        )
+
+    def run(self, resume: bool = False) -> None:
+        try:
+            if resume:
+                self.resume_existing()
+            else:
+                self.initialize()
+            assert self.state is not None
+            socket_path = os.environ.get("HERDR_SOCKET_PATH")
+            if not socket_path:
+                socket_path = str(Path.home() / ".config" / "herdr" / "herdr.sock")
+            # Subscribe before starting either Agent. Startup prompts (for
+            # example a CLI update dialog) are real blocked states and must
+            # not be lost during managed-pane initialization.
+            self.subscriber = EventSubscriber(
+                socket_path,
+                sorted(self.notification_pane_ids),
+            )
+            self.subscriber.start()
+            if resume:
+                self.set_phase("reviewing")
+                review = self.read_review_with_retry()
                 if review.get("result") not in {"approved", "changes_requested"}:
                     raise LoopError(
                         "Review JSON result must be 'approved' or 'changes_requested'"
@@ -892,24 +1172,140 @@ SHA and test result.
                     if item.get("severity") in {"blocking", "important"}
                 ]
                 if review.get("result") == "approved" and not blocking:
-                    self.set_phase("approved")
-                    log("review approved; no push or merge was performed")
+                    self.publish_approved_result()
+                    log("resumed approved Review; branch published and Draft PR is ready; no merge was performed")
                     return
                 if self.state.review_round >= self.state.max_review_rounds:
                     self.set_phase("awaiting_human", "maximum review rounds reached")
                     return
                 self.set_phase("fixing")
-                agent_prompt(
+                log(
+                    f"resumed Review requested changes; returning {len(blocking)} blocking/important findings "
+                    f"to coder {self.state.coder_pane_id}"
+                )
+                agent_prompt_with_retry(
                     self.state.coder_pane_id,
                     self.fix_prompt(review),
                     int(self.config["prompt_timeout_seconds"]),
+                    "resumed review findings prompt",
+                )
+            else:
+                self.start_managed_agents()
+                ensure_agent_target(self.state.coder_pane_id)
+                ensure_agent_target(self.state.reviewer_pane_id)
+                coder_start_status = self.wait_for_pane(self.state.coder_pane_id)
+                if coder_start_status in STOP_STATES:
+                    raise LoopError(f"coder entered {coder_start_status} during startup")
+                agent_prompt_with_retry(
+                    self.state.coder_pane_id,
+                    self.github_issue.task_prompt(self.issue)
+                    if self.github_issue.enabled
+                    else self.config["task"],
+                    int(self.config["prompt_timeout_seconds"]),
+                    "coding prompt",
+                )
+            while True:
+                coder_status = self.wait_for_pane(self.state.coder_pane_id)
+                if coder_status in STOP_STATES:
+                    raise LoopError(f"coder entered {coder_status}")
+                if self.state.coder_pane_id in self.resumed_panes:
+                    self.resumed_panes.remove(self.state.coder_pane_id)
+                    agent_prompt_with_retry(
+                        self.state.coder_pane_id,
+                        "Human intervention is complete. Continue the original task, run the required tests, and commit the result. Do not merge or push.",
+                        int(self.config["prompt_timeout_seconds"]),
+                        "resume prompt",
+                    )
+                    continue
+                try:
+                    self.require_new_commit()
+                    test_output = self.run_tests()
+                except LoopError as exc:
+                    self.set_phase("fixing", str(exc))
+                    agent_prompt_with_retry(
+                        self.state.coder_pane_id,
+                        f"Tests failed:\n\n{exc}\n\nFix the failure and commit the changes.",
+                        int(self.config["prompt_timeout_seconds"]),
+                        "test-failure prompt",
+                    )
+                    continue
+
+                self.state.review_round += 1
+                if self.state.review_round > self.state.max_review_rounds:
+                    self.set_phase("awaiting_human", "maximum review rounds reached")
+                    return
+                self.set_phase("reviewing")
+                agent_prompt_with_retry(
+                    self.state.reviewer_pane_id,
+                    self.review_prompt(test_output),
+                    int(self.config["prompt_timeout_seconds"]),
+                    "review prompt",
+                )
+                reviewer_status = self.wait_for_pane(self.state.reviewer_pane_id)
+                if reviewer_status in STOP_STATES:
+                    raise LoopError(f"reviewer entered {reviewer_status}")
+                if self.state.reviewer_pane_id in self.resumed_panes:
+                    self.resumed_panes.remove(self.state.reviewer_pane_id)
+                    agent_prompt_with_retry(
+                        self.state.reviewer_pane_id,
+                        self.review_prompt(test_output),
+                        int(self.config["prompt_timeout_seconds"]),
+                        "review resume prompt",
+                    )
+                    reviewer_status = self.wait_for_pane(self.state.reviewer_pane_id)
+                    if reviewer_status in STOP_STATES:
+                        raise LoopError(f"reviewer entered {reviewer_status}")
+                review = self.read_review_with_retry()
+                if review.get("result") not in {"approved", "changes_requested"}:
+                    raise LoopError(
+                        "Review JSON result must be 'approved' or 'changes_requested'"
+                    )
+                if review.get("reviewed_head_sha") != self.state.head_sha:
+                    raise LoopError(
+                        "Review result is not bound to the current head_sha; refusing stale review"
+                    )
+                self.state.last_result = review
+                self.state.save(self.state_path)
+                blocking = [
+                    item
+                    for item in review.get("findings", [])
+                    if item.get("severity") in {"blocking", "important"}
+                ]
+                if review.get("result") == "approved" and not blocking:
+                    self.publish_approved_result()
+                    log("review approved; branch published and Draft PR is ready; no merge was performed")
+                    return
+                if self.state.review_round >= self.state.max_review_rounds:
+                    self.set_phase("awaiting_human", "maximum review rounds reached")
+                    return
+                self.set_phase("fixing")
+                log(
+                    f"review requested changes; returning {len(blocking)} blocking/important findings "
+                    f"to coder {self.state.coder_pane_id}"
+                )
+                agent_prompt_with_retry(
+                    self.state.coder_pane_id,
+                    self.fix_prompt(review),
+                    int(self.config["prompt_timeout_seconds"]),
+                    "review findings prompt",
                 )
         except (LoopError, KeyboardInterrupt) as exc:
             if isinstance(exc, KeyboardInterrupt):
                 message = "stopped by user"
             else:
                 message = str(exc)
-            self.set_phase("failed", message)
+            if self.state is not None:
+                self.set_phase("failed", message)
+                self.notify_once(
+                    f"{self.state.task_id}:orchestrator:failed:{hashlib.sha256(message.encode()).hexdigest()}",
+                    {
+                        "agent_name": "Herdr Orchestrator",
+                        "status": "failed",
+                        "reason": message,
+                    },
+                )
+            else:
+                log(message)
             if isinstance(exc, LoopError):
                 log(message)
         finally:
@@ -924,6 +1320,11 @@ def main() -> int:
         type=Path,
         help="TOML config path; defaults to HERDR_PLUGIN_CONFIG_DIR/config.toml",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume the saved task state instead of creating a new worktree",
+    )
     args = parser.parse_args()
     config_path = args.config
     if config_path is None:
@@ -934,7 +1335,7 @@ def main() -> int:
             config_path = Path("config.toml")
     try:
         config = load_toml(config_path.expanduser())
-        ReviewLoop(config_path.expanduser(), config).run()
+        ReviewLoop(config_path.expanduser(), config).run(resume=args.resume)
         return 0
     except LoopError as exc:
         log(str(exc))

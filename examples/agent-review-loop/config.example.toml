@@ -12,8 +12,8 @@ test_command = ["just", "check"]
 max_review_rounds = 3
 prompt_timeout_seconds = 86400
 
-# The task is intentionally configured locally for Phase 1. It is not sent to
-# GitHub and the loop never pushes or merges.
+# With GitHub Issue mode enabled, an approved Review pushes the branch and
+# creates a Draft PR. The loop never merges.
 task = "Describe the implementation task here."
 
 
@@ -25,6 +25,8 @@ repo = "owner/repository"
 issue_number = 123
 write_back = false
 comment_updates = true
+push_on_approval = true
+draft_pr_on_approval = true
 
 # Optional human-intervention notifications. Disabled by default.
 # Supported platforms: generic, feishu, wecom.
