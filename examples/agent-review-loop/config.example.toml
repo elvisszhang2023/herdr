@@ -1,0 +1,36 @@
+# Copy this file to the plugin config directory and rename it config.toml.
+# The directory is printed by: herdr plugin config-dir example.agent-review-loop
+
+# The Orchestrator creates the task Workspace, worktree, two Panes, and Agents.
+repo_root = "/absolute/path/to/your/repository"
+base_branch = "main"
+branch_prefix = "codex"
+worktree_root = "/absolute/path/to/worktrees"
+coder_agent_kind = "codex"
+reviewer_agent_kind = "claude"
+test_command = ["just", "check"]
+max_review_rounds = 3
+prompt_timeout_seconds = 86400
+
+# The task is intentionally configured locally for Phase 1. It is not sent to
+# GitHub and the loop never pushes or merges.
+task = "Describe the implementation task here."
+
+
+# Instead of task above, enable one GitHub Issue as the authoritative task
+# input. The local gh CLI must already be authenticated for this repository.
+[github]
+enabled = false
+repo = "owner/repository"
+issue_number = 123
+write_back = false
+comment_updates = true
+
+# Optional human-intervention notifications. Disabled by default.
+# Supported platforms: generic, feishu, wecom.
+# For Feishu/WeCom, use the bot's incoming webhook URL.
+[notification]
+enabled = false
+platform = "feishu"
+webhook_url = "https://open.feishu.cn/open-apis/bot/v2/hook/replace-me"
+timeout_seconds = 10
