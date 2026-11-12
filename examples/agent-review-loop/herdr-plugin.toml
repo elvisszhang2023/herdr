@@ -1,6 +1,6 @@
 id = "example.agent-review-loop"
 name = "Agent Review Loop"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.9.0"
 description = "Automate a local coder and reviewer loop in two Herdr panes"
 platforms = ["macos", "linux"]

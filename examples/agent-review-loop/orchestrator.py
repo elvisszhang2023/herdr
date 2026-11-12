@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import threading
@@ -37,6 +38,8 @@ STOP_STATES = {"blocked", "unknown"}
 MAX_READ_LINES = 240
 PROMPT_RETRY_ATTEMPTS = 3
 REVIEW_READ_RETRY_SECONDS = 30
+VERIFY_READ_RETRY_SECONDS = 30
+APP_STOP_GRACE_SECONDS = 10
 
 
 class LoopError(RuntimeError):
@@ -80,7 +83,42 @@ def load_toml(path: Path) -> dict[str, Any]:
     github = data.get("github") or {}
     if not data.get("task") and not github.get("enabled", False):
         raise LoopError("configure task or enable github Issue input")
+    data["verify"] = load_verify_config(data.get("verify"))
     return data
+
+
+def load_verify_config(raw: Any) -> dict[str, Any]:
+    """Validate the optional runtime verification stage; disabled by default."""
+    verify = dict(raw) if isinstance(raw, dict) else {}
+    verify.setdefault("enabled", False)
+    verify.setdefault("verifier_agent_kind", "claude")
+    verify.setdefault("agent_args", [])
+    verify.setdefault("start_command", [])
+    verify.setdefault("stop_command", [])
+    verify.setdefault("ready_url", "")
+    verify.setdefault("ready_timeout_seconds", 120)
+    verify.setdefault("max_verify_rounds", 2)
+    verify.setdefault("scenario", "")
+    verify.setdefault("evidence_dir", ".herdr/evidence")
+    if not verify["enabled"]:
+        return verify
+    for key in ("start_command", "stop_command", "agent_args"):
+        value = verify[key]
+        if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+            raise LoopError(f"verify.{key} must be a TOML string array")
+    if not verify["start_command"]:
+        raise LoopError("verify.enabled requires verify.start_command")
+    ready_url = str(verify["ready_url"]).strip()
+    if not ready_url.startswith(("http://", "https://")):
+        raise LoopError("verify.ready_url must be an http:// or https:// URL")
+    verify["ready_url"] = ready_url
+    if int(verify["ready_timeout_seconds"]) <= 0 or int(verify["max_verify_rounds"]) <= 0:
+        raise LoopError("verify.ready_timeout_seconds and verify.max_verify_rounds must be positive")
+    evidence_dir = str(verify["evidence_dir"]).strip()
+    if not evidence_dir or Path(evidence_dir).is_absolute() or ".." in Path(evidence_dir).parts:
+        raise LoopError("verify.evidence_dir must be a relative path inside the worktree")
+    verify["evidence_dir"] = evidence_dir
+    return verify
 
 
 def herdr_binary() -> str:
@@ -354,6 +392,7 @@ feature branch. Do not merge or push. Report the commit SHA, tests, and risks.
         pr_url: str,
         review: dict[str, Any],
         head_sha: str,
+        verification: dict[str, Any] | None = None,
     ) -> None:
         """Write the local Agent Review result back to the PR once."""
         if not self.enabled or not pr_url:
@@ -394,6 +433,22 @@ feature branch. Do not merge or push. Report the commit SHA, tests, and risks.
                         f"  - Suggestion: {finding.get('suggestion', '')}",
                     ]
                 )
+        if verification:
+            steps = verification.get("steps") or []
+            passed = sum(1 for step in steps if step.get("status") == "passed")
+            lines.extend(
+                [
+                    "",
+                    "### Runtime verification",
+                    "",
+                    f"- Result: `{verification.get('result', 'unknown')}` ({passed}/{len(steps)} steps passed)",
+                    f"- Console errors: {len(verification.get('console_errors') or [])}",
+                    "",
+                    str(verification.get("summary") or "No summary provided."),
+                ]
+            )
+            for step in steps:
+                lines.append(f"- `{step.get('status', '?')}` {step.get('step', '')}")
         body = "\n".join(lines)
         result = run_command(
             ["gh", "pr", "comment", pr_url, "--repo", self.repo, "--body", body],
@@ -432,6 +487,11 @@ class LoopState:
     last_error: str | None = None
     notification_keys: list[str] = field(default_factory=list)
     updated_at: float = 0.0
+    # Runtime verification stage; defaults keep older state files resumable.
+    verifier_pane_id: str | None = None
+    verify_round: int = 0
+    max_verify_rounds: int = 0
+    last_verify_result: dict[str, Any] | None = None
 
     def save(self, path: Path) -> None:
         self.updated_at = time.time()
@@ -641,6 +701,9 @@ class ReviewLoop:
         self.repo = self.source_repo
         self.state_path = safe_state_path(config_path, config)
         self.review_result_path = self.repo / ".herdr" / "review-result.json"
+        self.verify_result_path = self.repo / ".herdr" / "verify-result.json"
+        self.verify_config: dict[str, Any] = config["verify"]
+        self.app_process: subprocess.Popen[bytes] | None = None
         self.subscriber: EventSubscriber | None = None
         self.state: LoopState | None = None
         self.notifier = BlockNotifier(config)
@@ -665,8 +728,8 @@ class ReviewLoop:
         prefix = re.sub(r"[^A-Za-z0-9._/-]+", "-", str(self.config.get("branch_prefix", "codex"))).strip("/-")
         return f"{prefix}/{suffix}" if prefix else suffix
 
-    def create_managed_worktree(self) -> tuple[str, str, str, str, str]:
-        """Create the isolated checkout and its two dynamic Herdr panes."""
+    def create_managed_worktree(self) -> tuple[str, str, str, str, str, str | None]:
+        """Create the isolated checkout and its dynamic Herdr panes."""
         if git(self.source_repo, "status", "--porcelain"):
             raise LoopError("source repository is not clean; commit or stash changes before starting")
         base_branch = str(self.config["base_branch"])
@@ -721,8 +784,24 @@ class ReviewLoop:
         )
         if not reviewer_pane_id:
             raise LoopError("herdr pane split did not return the new pane_id")
+        verifier_pane_id: str | None = None
+        if self.verify_config["enabled"]:
+            verifier_output = run_command(
+                [herdr_binary(), "pane", "split", reviewer_pane_id, "--direction", "down", "--cwd", str(actual_path), "--no-focus"],
+                timeout=60,
+            ).stdout
+            verifier_result = json_result(verifier_output, "herdr pane split (verifier)")
+            verifier_pane_id = str(
+                (verifier_result.get("pane") or {}).get("pane_id")
+                or verifier_result.get("pane_id")
+                or verifier_result.get("created_pane_id")
+                or ""
+            )
+            if not verifier_pane_id:
+                raise LoopError("herdr pane split did not return the verifier pane_id")
         self.repo = actual_path
         self.review_result_path = self.repo / ".herdr" / "review-result.json"
+        self.verify_result_path = self.repo / ".herdr" / "verify-result.json"
         self.review_result_path.parent.mkdir(parents=True, exist_ok=True)
         exclude_path = Path(git(self.repo, "rev-parse", "--git-path", "info/exclude"))
         if not exclude_path.is_absolute():
@@ -735,7 +814,9 @@ class ReviewLoop:
                     handle.write("\n")
                 handle.write("# Herdr agent-review-loop runtime files\n/.herdr/\n")
         self.notification_pane_ids.update({root_pane_id, reviewer_pane_id})
-        return branch, base_sha, workspace_id, root_pane_id, reviewer_pane_id
+        if verifier_pane_id:
+            self.notification_pane_ids.add(verifier_pane_id)
+        return branch, base_sha, workspace_id, root_pane_id, reviewer_pane_id, verifier_pane_id
 
     def start_managed_agents(self) -> None:
         assert self.state is not None
@@ -763,6 +844,17 @@ class ReviewLoop:
             ],
             timeout=120,
         )
+        if self.state.verifier_pane_id:
+            verifier_kind = str(self.verify_config["verifier_agent_kind"])
+            argv = [
+                herdr_binary(), "agent", "start", "verifier",
+                "--kind", verifier_kind,
+                "--pane", self.state.verifier_pane_id,
+            ]
+            agent_args = [str(item) for item in self.verify_config["agent_args"]]
+            if agent_args:
+                argv.extend(["--", *agent_args])
+            run_command(argv, timeout=120)
 
     def base_sha(self) -> str:
         return git(self.repo, "rev-parse", self.config["base_branch"])
@@ -770,7 +862,7 @@ class ReviewLoop:
     def initialize(self) -> None:
         if self.github_issue.enabled:
             self.issue = self.github_issue.load()
-        branch, base_sha, workspace_id, coder_pane_id, reviewer_pane_id = self.create_managed_worktree()
+        branch, base_sha, workspace_id, coder_pane_id, reviewer_pane_id, verifier_pane_id = self.create_managed_worktree()
         current_sha = git(self.repo, "rev-parse", "HEAD")
         if self.github_issue.enabled:
             task_id = f"github-{self.github_issue.repo.replace('/', '-')}-issue-{self.github_issue.number}"
@@ -794,6 +886,8 @@ class ReviewLoop:
             issue_repo=self.github_issue.repo if self.github_issue.enabled else None,
             issue_number=self.github_issue.number if self.github_issue.enabled else None,
             issue_url=self.issue.get("url") if self.github_issue.enabled else None,
+            verifier_pane_id=verifier_pane_id,
+            max_verify_rounds=int(self.verify_config["max_verify_rounds"]) if verifier_pane_id else 0,
         )
         self.state.save(self.state_path)
         log(f"state file: {self.state_path}")
@@ -815,9 +909,14 @@ class ReviewLoop:
         if not self.repo.is_dir():
             raise LoopError(f"saved task worktree does not exist: {self.repo}")
         self.review_result_path = self.repo / ".herdr" / "review-result.json"
+        self.verify_result_path = self.repo / ".herdr" / "verify-result.json"
         self.notification_pane_ids.update(
             {self.state.coder_pane_id, self.state.reviewer_pane_id}
         )
+        if self.state.verifier_pane_id:
+            self.notification_pane_ids.add(self.state.verifier_pane_id)
+        elif self.verify_config["enabled"]:
+            log("verify is enabled in config but the saved task has no verifier pane; skipping verification on resume")
         if self.github_issue.enabled:
             self.issue = self.github_issue.load()
         log(
@@ -881,6 +980,8 @@ class ReviewLoop:
             agent_name = "编码 Agent"
         elif pane_id == self.state.reviewer_pane_id:
             agent_name = "Review Agent"
+        elif pane_id == self.state.verifier_pane_id:
+            agent_name = "验收 Agent"
         else:
             agent_name = f"Agent ({pane_id})"
         reason = event_reason(event)
@@ -894,6 +995,14 @@ class ReviewLoop:
                 "reason": reason,
             },
         )
+
+    def phase_for_pane(self, pane_id: str) -> str:
+        assert self.state is not None
+        if pane_id == self.state.coder_pane_id:
+            return "coding"
+        if pane_id == self.state.verifier_pane_id:
+            return "verifying"
+        return "reviewing"
 
     def wait_for_pane(self, pane_id: str) -> str:
         assert self.subscriber is not None
@@ -922,7 +1031,7 @@ class ReviewLoop:
                     self.blocked_panes.remove(pane_id)
                     self.resumed_panes.add(pane_id)
                     self.set_phase(
-                        "coding" if pane_id == self.state.coder_pane_id else "reviewing",
+                        self.phase_for_pane(pane_id),
                         "Agent resumed after human intervention",
                     )
                 if status in TERMINAL_STATES | STOP_STATES:
@@ -946,7 +1055,7 @@ class ReviewLoop:
                 self.blocked_panes.remove(pane_id)
                 self.resumed_panes.add(pane_id)
                 self.set_phase(
-                    "coding" if pane_id == self.state.coder_pane_id else "reviewing",
+                    self.phase_for_pane(pane_id),
                     "Agent resumed after human intervention",
                 )
             if status in TERMINAL_STATES | STOP_STATES:
@@ -962,6 +1071,254 @@ class ReviewLoop:
             raise LoopError(f"tests failed ({result.returncode})\n{output}")
         log("tests passed")
         return output
+
+    def start_app(self) -> None:
+        """Start the application under test and wait until it answers."""
+        assert self.state is not None
+        command = [str(item) for item in self.verify_config["start_command"]]
+        log_path = self.repo / ".herdr" / "verify-app.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log(f"starting app: {shlex.join(command)}")
+        with log_path.open("ab") as handle:
+            try:
+                self.app_process = subprocess.Popen(
+                    command,
+                    cwd=self.repo,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise LoopError(f"cannot start verify.start_command: {exc}") from exc
+        deadline = time.monotonic() + int(self.verify_config["ready_timeout_seconds"])
+        ready_url = str(self.verify_config["ready_url"])
+        while time.monotonic() < deadline:
+            if self.app_process.poll() is not None:
+                raise LoopError(
+                    f"app exited with {self.app_process.returncode} before {ready_url} was ready; "
+                    f"log tail:\n{self.app_log_tail(log_path)}"
+                )
+            try:
+                with urllib_request.urlopen(ready_url, timeout=5) as response:
+                    if response.status < 400:
+                        log(f"app is ready at {ready_url}")
+                        return
+            except (OSError, urllib_error.URLError):
+                pass
+            time.sleep(2)
+        raise LoopError(
+            f"app did not become ready at {ready_url} within "
+            f"{self.verify_config['ready_timeout_seconds']}s; log tail:\n{self.app_log_tail(log_path)}"
+        )
+
+    @staticmethod
+    def app_log_tail(log_path: Path, limit: int = 2000) -> str:
+        try:
+            return log_path.read_text(errors="replace")[-limit:]
+        except OSError:
+            return "(no app log)"
+
+    def stop_app(self) -> None:
+        """Stop the app under test even when verification failed midway."""
+        process = self.app_process
+        self.app_process = None
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                process.wait(timeout=APP_STOP_GRACE_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=APP_STOP_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    log(f"app process {process.pid} did not exit after SIGKILL")
+        stop_command = [str(item) for item in self.verify_config.get("stop_command", [])]
+        if stop_command:
+            result = run_command(stop_command, cwd=self.repo, timeout=60, check=False)
+            if result.returncode not in (0, 1):
+                log(f"verify.stop_command exited {result.returncode}: {result.stdout[-1000:]}")
+
+    def verification_prompt(self) -> str:
+        assert self.state is not None
+        head_sha = self.state.head_sha or git(self.repo, "rev-parse", "HEAD")
+        try:
+            self.verify_result_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise LoopError(
+                f"cannot remove previous verification result {self.verify_result_path}: {exc}"
+            ) from exc
+        round_dir = self.evidence_round_dir()
+        round_dir.mkdir(parents=True, exist_ok=True)
+        scenario = str(self.verify_config.get("scenario", "")).strip()
+        if not scenario and self.github_issue.enabled:
+            scenario = (
+                "Derive the acceptance scenario from the GitHub Issue requirements below, "
+                "including its reproduction and expected behavior steps.\n\n"
+                f"{self.github_issue.task_prompt(self.issue)}"
+            )
+        if not scenario:
+            raise LoopError("verify needs verify.scenario or an enabled GitHub Issue")
+        findings_example = (
+            '{"severity":"blocking","file":"src/path","line":1,'
+            '"message":"what the user sees and why it is wrong","suggestion":"fix direction"}'
+        )
+        ready_url = str(self.verify_config["ready_url"])
+        return f"""You are the read-only runtime verifier for task {self.state.task_id}.
+
+The application is already running at {ready_url}. Head commit {head_sha} in {self.repo}.
+Unit tests and code review already passed. Your job is to use it like a real user.
+
+Acceptance scenario:
+{scenario}
+
+Rules:
+- Use browser automation to open, click, type, and screenshot the real UI. Do not
+  judge behavior from source code alone.
+- For every scenario step, save a screenshot under {round_dir} as
+  step-<k>-<short-name>.png, keeping the steps in order.
+- Record every browser console error and every failed network request you notice.
+- Ignore purely cosmetic nits. Report only what breaks the scenario or would
+  make a user think the feature is broken.
+- Do not modify source files, commit, push, reset, or merge. The only files you
+  may write are evidence screenshots and the result JSON below.
+
+Write the final result atomically to this exact file:
+{self.verify_result_path}
+
+JSON shape:
+{{"result":"passed"|"failed"|"unavailable","verified_head_sha":"{head_sha}",
+ "steps":[{{"step":"...","status":"passed"|"failed","evidence":"{round_dir}/step-1-....png","note":"..."}}],
+ "console_errors":["..."],
+ "findings":[{findings_example}],
+ "summary":"short conclusion"}}
+
+Use "failed" when the scenario does not hold. Use "unavailable" only when no
+browser automation tool is available; explain that in summary and findings.
+After writing the file you may briefly report completion in the terminal, but
+the file is the authoritative verification result.
+"""
+
+    def evidence_round_dir(self) -> Path:
+        assert self.state is not None
+        relative = Path(str(self.verify_config["evidence_dir"])) / f"round-{self.state.verify_round}"
+        return self.repo / relative
+
+    def read_verify_with_retry(self) -> dict[str, Any]:
+        """Read the verification result file, with terminal output as fallback."""
+        assert self.state is not None
+        deadline = time.monotonic() + VERIFY_READ_RETRY_SECONDS
+        last_text = ""
+        last_file_error = ""
+        while True:
+            if self.verify_result_path.exists():
+                try:
+                    result = json.loads(self.verify_result_path.read_text())
+                    if not isinstance(result, dict):
+                        last_file_error = "verification file does not contain a JSON object"
+                    elif result.get("verified_head_sha") != self.state.head_sha:
+                        last_file_error = (
+                            "verification file has a stale verified_head_sha "
+                            f"{result.get('verified_head_sha')!r}"
+                        )
+                    else:
+                        log(
+                            "verification file parsed: "
+                            f"result={result.get('result')} "
+                            f"steps={len(result.get('steps') or [])}"
+                        )
+                        return result
+                except (OSError, json.JSONDecodeError) as exc:
+                    last_file_error = f"verification file is not complete JSON: {exc}"
+            try:
+                last_text = agent_read(self.state.verifier_pane_id or "")
+            except LoopError as exc:
+                if "agent_not_idle" not in str(exc) and "agent_not_found" not in str(exc):
+                    raise
+                last_file_error = str(exc)
+            result = latest_json_object(last_text)
+            if result is not None and result.get("verified_head_sha") == self.state.head_sha:
+                log("verification terminal fallback parsed")
+                return result
+            if time.monotonic() >= deadline:
+                excerpt = re.sub(r"\s+", " ", last_text[-1000:]).strip()
+                raise LoopError(
+                    "could not read a current verification result after retries; "
+                    f"{last_file_error}; last output: {excerpt}"
+                )
+            log("verification result file is not ready; retrying read")
+            time.sleep(2)
+
+    def run_verification(self) -> dict[str, Any]:
+        """Start the app, let the verifier use it, and stop the app again."""
+        assert self.state is not None and self.state.verifier_pane_id
+        self.set_phase("verifying", f"round {self.state.verify_round}/{self.state.max_verify_rounds}")
+        self.start_app()
+        try:
+            agent_prompt_with_retry(
+                self.state.verifier_pane_id,
+                self.verification_prompt(),
+                int(self.config["prompt_timeout_seconds"]),
+                "verification prompt",
+            )
+            status = self.wait_for_pane(self.state.verifier_pane_id)
+            if status in STOP_STATES:
+                raise LoopError(f"verifier entered {status}")
+            return self.read_verify_with_retry()
+        finally:
+            self.stop_app()
+
+    @staticmethod
+    def blocking_findings(result: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in result.get("findings", [])
+            if item.get("severity") in {"blocking", "important"}
+        ]
+
+    def verify_then_publish(self, review: dict[str, Any]) -> bool:
+        """Verify an approved head at runtime, then publish it.
+
+        Returns True when the loop is finished (published or waiting for a
+        human), and False when the verifier sent findings back to the coder.
+        """
+        assert self.state is not None
+        if not (self.verify_config["enabled"] and self.state.verifier_pane_id):
+            self.publish_approved_result()
+            log("review approved; branch published and Draft PR is ready; no merge was performed")
+            return True
+        self.state.verify_round += 1
+        if self.state.verify_round > self.state.max_verify_rounds:
+            self.set_phase("awaiting_human", "maximum verification rounds reached")
+            return True
+        result = self.run_verification()
+        self.state.last_verify_result = result
+        self.state.save(self.state_path)
+        blocking = self.blocking_findings(result)
+        if result.get("result") == "unavailable":
+            self.set_phase(
+                "awaiting_human",
+                "the verifier has no browser automation tool; enable one or run the scenario manually",
+            )
+            return True
+        if result.get("result") == "passed" and not blocking:
+            self.publish_approved_result()
+            log("review and runtime verification passed; Draft PR is ready; no merge was performed")
+            return True
+        self.set_phase("fixing", "runtime verification failed")
+        log(
+            f"runtime verification failed with {len(blocking)} blocking/important findings and "
+            f"{len(result.get('steps') or [])} scenario steps; returning findings to coder"
+        )
+        agent_prompt_with_retry(
+            self.state.coder_pane_id,
+            self.fix_prompt(review, result),
+            int(self.config["prompt_timeout_seconds"]),
+            "verification findings prompt",
+        )
+        return False
 
     def require_new_commit(self) -> str:
         assert self.state is not None
@@ -985,6 +1342,7 @@ class ReviewLoop:
                 f"cannot remove previous Review result {self.review_result_path}: {exc}"
             ) from exc
         stat = git(self.repo, "diff", "--stat", f"{self.state.base_sha}..{head_sha}")
+        evidence = self.previous_verification_section()
         return f"""You are the read-only Review Agent for task {self.state.task_id}.
 
 Review commit {head_sha} against base commit {self.state.base_sha} in {self.repo}.
@@ -996,7 +1354,7 @@ Tests already passed:
 
 Diff stat:
 {stat[-3000:]}
-
+{evidence}
 Do not modify files, commit, push, reset, or merge anything.
 Write the final result as a JSON object to this exact file:
 {self.review_result_path}
@@ -1009,19 +1367,67 @@ After writing the file, you may briefly report completion in the terminal, but
 the file is the authoritative Review result.
 """
 
-    def fix_prompt(self, review: dict[str, Any]) -> str:
-        findings = [
-            finding
-            for finding in review.get("findings", [])
-            if finding.get("severity") in {"blocking", "important"}
+    def previous_verification_section(self) -> str:
+        """Describe the last runtime verification so the reviewer checks it was fixed."""
+        assert self.state is not None
+        result = self.state.last_verify_result
+        if not result or result.get("result") == "passed":
+            return ""
+        failed_steps = [
+            step for step in result.get("steps") or [] if step.get("status") != "passed"
         ]
-        return f"""Review found these issues in the current feature branch:
+        lines = [
+            "",
+            f"Runtime verification of the previous head {result.get('verified_head_sha', '')} failed:",
+            str(result.get("summary") or "(no summary)"),
+        ]
+        for step in failed_steps[:20]:
+            lines.append(
+                f"- step: {step.get('step', '')} | note: {step.get('note', '')} | evidence: {step.get('evidence', '')}"
+            )
+        console_errors = result.get("console_errors") or []
+        if console_errors:
+            lines.append(f"- console errors: {len(console_errors)}; first: {str(console_errors[0])[:300]}")
+        lines.append(
+            "Open the evidence screenshots and confirm the new head actually fixes these "
+            "behaviors. Treat an unfixed runtime failure as a blocking finding."
+        )
+        return "\n".join(lines) + "\n"
+
+    def fix_prompt(self, review: dict[str, Any], verification: dict[str, Any] | None = None) -> str:
+        findings = self.blocking_findings(review)
+        if verification is None:
+            return f"""Review found these issues in the current feature branch:
 
 {json.dumps(findings, ensure_ascii=False, indent=2)}
 
 Fix these issues, add or update tests where needed, run the configured test command,
 and commit the fixes. Do not merge or push. When finished, report the new commit
 SHA and test result.
+"""
+        failed_steps = [
+            step for step in verification.get("steps") or [] if step.get("status") != "passed"
+        ]
+        return f"""Code review approved the current feature branch, but runtime verification
+of head {verification.get('verified_head_sha', '')} failed when a verifier used the
+running application like a real user.
+
+Summary:
+{verification.get('summary', '')}
+
+Failed scenario steps (each has a screenshot you should open):
+{json.dumps(failed_steps, ensure_ascii=False, indent=2)}
+
+Browser console errors:
+{json.dumps(verification.get('console_errors') or [], ensure_ascii=False, indent=2)}
+
+Findings:
+{json.dumps(self.blocking_findings(verification), ensure_ascii=False, indent=2)}
+
+Reproduce each failure in the running application before changing code, fix the
+root cause, add a regression test where practical, run the configured test
+command, and commit. Do not merge or push. When finished, report the new commit
+SHA, what you reproduced, and how you confirmed the behavior now works.
 """
 
     def read_review_with_retry(self) -> dict[str, Any]:
@@ -1109,6 +1515,7 @@ SHA and test result.
                 self.state.pr_url,
                 self.state.last_result,
                 self.state.head_sha or git(self.repo, "rev-parse", "HEAD"),
+                self.state.last_verify_result,
             )
         if self.state.pr_url:
             detail = f"Draft PR created or reused: {self.state.pr_url}"
@@ -1122,6 +1529,7 @@ SHA and test result.
             f"- Branch: `{self.state.branch}`\n"
             f"- Commit: `{self.state.head_sha}`\n"
             f"- PR: {self.state.pr_url or '(URL unavailable)'}\n"
+            f"- Runtime verification: `{self.verification_status_label()}`\n"
             "- Status: `agent-approved` (not merged)"
         )
         self.notify_once(
@@ -1134,6 +1542,15 @@ SHA and test result.
                 "pr_url": self.state.pr_url,
             },
         )
+
+    def verification_status_label(self) -> str:
+        assert self.state is not None
+        result = self.state.last_verify_result
+        if not result:
+            return "skipped"
+        steps = result.get("steps") or []
+        passed = sum(1 for step in steps if step.get("status") == "passed")
+        return f"{result.get('result', 'unknown')} ({passed}/{len(steps)} steps)"
 
     def run(self, resume: bool = False) -> None:
         try:
@@ -1172,23 +1589,24 @@ SHA and test result.
                     if item.get("severity") in {"blocking", "important"}
                 ]
                 if review.get("result") == "approved" and not blocking:
-                    self.publish_approved_result()
-                    log("resumed approved Review; branch published and Draft PR is ready; no merge was performed")
-                    return
-                if self.state.review_round >= self.state.max_review_rounds:
-                    self.set_phase("awaiting_human", "maximum review rounds reached")
-                    return
-                self.set_phase("fixing")
-                log(
-                    f"resumed Review requested changes; returning {len(blocking)} blocking/important findings "
-                    f"to coder {self.state.coder_pane_id}"
-                )
-                agent_prompt_with_retry(
-                    self.state.coder_pane_id,
-                    self.fix_prompt(review),
-                    int(self.config["prompt_timeout_seconds"]),
-                    "resumed review findings prompt",
-                )
+                    if self.verify_then_publish(review):
+                        return
+                    # The verifier returned findings to the coder; continue the loop.
+                else:
+                    if self.state.review_round >= self.state.max_review_rounds:
+                        self.set_phase("awaiting_human", "maximum review rounds reached")
+                        return
+                    self.set_phase("fixing")
+                    log(
+                        f"resumed Review requested changes; returning {len(blocking)} blocking/important findings "
+                        f"to coder {self.state.coder_pane_id}"
+                    )
+                    agent_prompt_with_retry(
+                        self.state.coder_pane_id,
+                        self.fix_prompt(review),
+                        int(self.config["prompt_timeout_seconds"]),
+                        "resumed review findings prompt",
+                    )
             else:
                 self.start_managed_agents()
                 ensure_agent_target(self.state.coder_pane_id)
@@ -1272,9 +1690,9 @@ SHA and test result.
                     if item.get("severity") in {"blocking", "important"}
                 ]
                 if review.get("result") == "approved" and not blocking:
-                    self.publish_approved_result()
-                    log("review approved; branch published and Draft PR is ready; no merge was performed")
-                    return
+                    if self.verify_then_publish(review):
+                        return
+                    continue
                 if self.state.review_round >= self.state.max_review_rounds:
                     self.set_phase("awaiting_human", "maximum review rounds reached")
                     return
@@ -1309,6 +1727,7 @@ SHA and test result.
             if isinstance(exc, LoopError):
                 log(message)
         finally:
+            self.stop_app()
             if self.subscriber is not None:
                 self.subscriber.stop()
 

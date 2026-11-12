@@ -4,14 +4,17 @@ Phase 1 automation for a local two-agent workflow. By default the
 Orchestrator owns the Git and Herdr isolation lifecycle:
 
 ```text
-Orchestrator worktree → dynamic Workspace/Pane → Codex coding → local commit → local tests → Claude review
-     ↑                                  ↓
-     └──── findings and automatic fix ┘
+Orchestrator worktree → dynamic Workspace/Pane → Codex coding → local commit → local tests → Claude review → runtime verification
+     ↑                                  ↓                                                          ↓
+     └──── findings and automatic fix ──┴──────────────────────────────────────────────────────────┘
 ```
 
-The loop runs for at most three review rounds. After Review approval, the
-Orchestrator pushes the branch and creates or reuses a Draft PR. It never
-merges. The managed worktree and branch remain for inspection.
+The loop runs for at most three review rounds. After Review approval, an
+optional verifier Agent uses the running application like a real user; failed
+scenarios go straight back to the coding Agent without another review round.
+Once the head passes, the Orchestrator pushes the branch and creates or reuses
+a Draft PR. It never merges. The managed worktree and branch remain for
+inspection.
 
 When configured, the orchestrator can also notify a human when any pane listed
 in `notification_pane_ids` enters `blocked`, or when the orchestrator enters `awaiting_human`. The
@@ -115,6 +118,65 @@ a Review prompt that contains the base SHA and current head SHA. Review
 findings are parsed from a JSON object and sent back to Codex. Returning to an
 idle state without a new commit is treated as an incomplete coding round.
 
+## Runtime verification
+
+Unit tests assert what the developer expected, and code review reads the diff.
+Neither proves the feature works when a person clicks through it. The optional
+`[verify]` stage closes that gap for web projects:
+
+```toml
+[verify]
+enabled = true
+verifier_agent_kind = "claude"
+start_command = ["npm", "run", "dev", "--", "--port", "5173"]
+ready_url = "http://localhost:5173"
+max_verify_rounds = 2
+scenario = """
+1. Open the home page and confirm the list renders.
+2. Create an item and confirm it appears without console errors.
+"""
+```
+
+When enabled, the Orchestrator splits a third Pane below the reviewer and starts
+`verifier_agent_kind` there. The verifier needs a browser automation tool, for
+example the Playwright MCP server configured for Claude Code; `agent_args` are
+appended to `herdr agent start -- ...` so you can pre-approve those tools and
+avoid permission prompts that would block the Pane.
+
+After each review approval the Orchestrator starts `start_command` in the task
+worktree as its own process group, waits until `ready_url` answers, and sends
+the verifier the acceptance scenario together with the head SHA. The verifier
+walks the scenario in a real browser, stores one screenshot per step under
+`evidence_dir/round-<n>/`, collects console errors and failed requests, and
+writes `.herdr/verify-result.json`:
+
+```json
+{
+  "result": "passed",
+  "verified_head_sha": "def456",
+  "steps": [
+    {"step": "Open the home page", "status": "passed", "evidence": ".herdr/evidence/round-1/step-1-home.png", "note": ""}
+  ],
+  "console_errors": [],
+  "findings": [],
+  "summary": "All scenario steps behave as described."
+}
+```
+
+`verified_head_sha` must match the reviewed head; stale results are rejected.
+A `failed` result sends the failed steps, screenshots, console errors, and
+findings directly to the coding Agent, counted by `verify_round` rather than
+`review_round`. The next commit goes through tests, review, and verification
+again, and the next review prompt lists the previous runtime failures so the
+reviewer can confirm they are fixed. `unavailable` means the verifier had no
+browser tool and the loop waits for a human. The application is stopped after
+every round and when the Orchestrator exits. The Draft PR comment includes the
+verification summary and per-step results.
+
+Without a `scenario`, GitHub Issue mode asks the verifier to derive the steps
+from the Issue text. Keep the scenario user-facing: what to open, click, type,
+and what should be visible afterwards.
+
 ## Expected review output
 
 Claude is asked to output one JSON object:
@@ -167,5 +229,7 @@ The program prints phase transitions and command failures to its terminal Pane.
 - The configured test command is an argv array, not a shell string.
 - Review is tied to the exact `head_sha` that was tested.
 - Review Agent prompts prohibit writes, commits, pushes, resets, and merges.
-- The loop stops after `max_review_rounds`.
-- The loop never runs `git push`, PR creation, or merge commands.
+- The loop stops after `max_review_rounds` or `max_verify_rounds`.
+- The verifier is instructed to write only evidence screenshots and its result file.
+- The loop never merges; it pushes and opens a Draft PR only in GitHub Issue
+  mode after review and verification pass.

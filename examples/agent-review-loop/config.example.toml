@@ -36,3 +36,33 @@ enabled = false
 platform = "feishu"
 webhook_url = "https://open.feishu.cn/open-apis/bot/v2/hook/replace-me"
 timeout_seconds = 10
+
+# Optional runtime verification after code review approves. Disabled by default.
+# A third Pane runs a verifier Agent with browser automation (for example the
+# Playwright MCP server configured for Claude Code). The Orchestrator starts the
+# application with start_command, waits until ready_url answers, lets the
+# verifier walk the scenario, and stops the application again. Failed scenarios
+# go straight back to the coding Agent; only a passing head is pushed.
+[verify]
+enabled = false
+verifier_agent_kind = "claude"
+# Extra arguments appended to `herdr agent start -- ...`, for example to
+# pre-approve browser tools so the verifier does not block on permission prompts.
+agent_args = []
+# argv array, not a shell string. Use a dedicated port so the task worktree does
+# not collide with your own dev server.
+start_command = ["npm", "run", "dev", "--", "--port", "5173"]
+ready_url = "http://localhost:5173"
+ready_timeout_seconds = 120
+# Optional extra cleanup after the Orchestrator stops the start_command process group.
+stop_command = []
+max_verify_rounds = 2
+# Relative to the task worktree; /.herdr/ is already excluded from git.
+evidence_dir = ".herdr/evidence"
+# User-facing acceptance scenario. With GitHub Issue mode enabled and no scenario,
+# the verifier derives the steps from the Issue text.
+scenario = """
+1. Open the home page and confirm the list renders data without console errors.
+2. Click "New", fill in the form, submit, and confirm the new row appears.
+3. Reload the page and confirm the new row is still there.
+"""
