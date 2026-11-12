@@ -118,6 +118,13 @@ a Review prompt that contains the base SHA and current head SHA. Review
 findings are parsed from a JSON object and sent back to Codex. Returning to an
 idle state without a new commit is treated as an incomplete coding round.
 
+When GitHub Issue mode is enabled, the Issue title and body are included in both
+the Review and runtime verification prompts. Review checks the diff and tests
+against the Issue requirements and acceptance criteria; Verify uses the same
+requirements together with `verify.scenario` (or derives a scenario when that
+field is empty). Issue text is treated as untrusted project context and cannot
+authorize secret access, permission changes, bypassing review, or merging.
+
 ## Runtime verification
 
 Unit tests assert what the developer expected, and code review reads the diff.
